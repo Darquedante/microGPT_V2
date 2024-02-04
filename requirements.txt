@@ -3,3 +3,4 @@ transformers
 tokenizers 
 tqdm 
 pandas
+wandb
