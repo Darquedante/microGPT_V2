@@ -103,15 +103,43 @@ class ModelConfigurator(tk.Tk):
 
 
     def estimate_vram(self):
-        # Simplified VRAM estimation formula
-        # Note: This formula is illustrative and should be adjusted based on empirical data and specific model architecture
-        model_size = sum(int(self.entries[setting].get()) for setting in ["n_embd", "vocab_size", "n_layer"]) / 1e6  # Simplified model size in GB
-        dataset_size = float(self.entries["dataset_size_gb"].get())
-        batch_size = int(self.entries["batch_size"].get())
-        vram_usage = (model_size * batch_size + dataset_size) * 1.2  # Assuming a 20% overhead
-
-        messagebox.showinfo("VRAM Estimation", f"Estimated VRAM Required: {vram_usage:.2f} GB")
-
+        """Estimates VRAM required for training, considering detailed model parameters and settings."""
+    
+        # Check if fp16 is used - assuming an interface element (checkbox) for the user to specify this
+        use_fp16 = self.config_settings.get("use_fp16", False)  # Example: Add a checkbox in your GUI for this setting
+    
+        # Model parameter count approximation
+        n_embd = int(self.entries["n_embd"].get())
+        vocab_size = int(self.entries["vocab_size"].get())
+        n_head = int(self.entries["n_head"].get())
+        n_layer = int(self.entries["n_layer"].get())
+        max_length = int(self.entries["max_length"].get())
+    
+        # Basic calculation for model parameters - this should be adjusted based on your specific model's architecture
+        total_params = (n_embd * vocab_size) + (n_head * n_layer * max_length)  # Simplified example
+    
+        # Calculation adjustments for fp16
+        bytes_per_param = 2 if use_fp16 else 4  # fp16 uses 2 bytes, fp32 uses 4 bytes
+        model_size_bytes = total_params * bytes_per_param
+        model_size_gb = model_size_bytes / (1024 ** 3)  # Convert bytes to GB
+    
+        # Batch size and dataset size
+        batch_size = int(self.config_settings["batch_size"])
+        dataset_size_gb = float(self.config_settings["dataset_size_gb"])
+    
+        # Estimating additional memory usage: gradients, activations, etc.
+        # Adjust these factors based on empirical data and specific training configurations
+        gradient_accumulation_factor = 2 if use_fp16 else 4  # Gradient accumulation can significantly increase VRAM usage
+        activation_memory_factor = 1.5  # Activations during forward/backward passes
+        optimizer_overhead = 1.2 if use_fp16 else 1.5  # Optimizer states (e.g., Adam) also require memory
+    
+        # Comprehensive VRAM estimation
+        vram_usage_gb = model_size_gb * (gradient_accumulation_factor + activation_memory_factor) * batch_size
+        vram_usage_gb += dataset_size_gb  # Adding dataset size
+        vram_usage_gb *= optimizer_overhead  # Adjusting for optimizer overhead
+    
+        # Display estimated VRAM requirement
+        messagebox.showinfo("VRAM Estimation", f"Estimated VRAM Required: {vram_usage_gb:.2f} GB")
 
     def apply_preset(self, event=None):
         """When preset selected, apply config"""
