@@ -1,31 +1,17 @@
 from gpt import GPT
 from tqdm import tqdm
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 import pandas as pd
 from transformers import GPT2TokenizerFast
 from config import GPTConfig
 import numpy as np
 import math
 import torch
-import torch.distributed as dist
 import os
 import wandb
 import json
-import argparse
 
-# DDP: Parse command line arguments for DDP
-parser = argparse.ArgumentParser(description='Distributed GPT Training')
-parser.add_argument('--local_rank', type=int, default=-1,
-                    help='Local rank of the process. Should be provided by the launch utility.')
-args = parser.parse_args()
-
-# DDP: Initialize process group
-if torch.cuda.is_available():
-    torch.cuda.set_device(args.local_rank)
-    dist.init_process_group(backend='nccl')
-
-# DDP: Setup device for the current process
-device = torch.device(f"cuda:{args.local_rank}" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device_type = "cuda" if torch.cuda.is_available() else "cpu"
 
 max_length = 512
@@ -80,38 +66,65 @@ id=None
 # dataset
 dataset = "memmap"
 data_dir = 'datasets'
+
 if dataset == "memmap":
-    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    val_data = np.memmap(os.path.join(data_dir, 'validation.bin'), dtype=np.uint16, mode='r')
-    # For 'memmap', ensure custom logic later to handle data distribution among processes
+    train_data = np.memmap(os.path.join(
+    data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    val_data = np.memmap(os.path.join(
+        data_dir, 'validation.bin'), dtype=np.uint16, mode='r')
 elif dataset == "huggingface":
     from datasets import load_from_disk
-    from torch.utils.data.distributed import DistributedSampler
 
-    num_workers = 4
+    num_workers=4
     train_data = load_from_disk("datasets/train")
     val_data = load_from_disk("datasets/validation")
-    
     train_data.set_format(type="torch", output_all_columns=True)
     val_data.set_format(type="torch", output_all_columns=True)
-
-    # Use DistributedSampler for distributed training
-    train_sampler = DistributedSampler(train_data, shuffle=True)
-    val_sampler = DistributedSampler(val_data, shuffle=False)  # Typically, validation data isn't shuffled
-
-    dataloader = DataLoader(train_data, batch_size=batch_size, num_workers=num_workers, sampler=train_sampler)
-    dataloader_val = DataLoader(val_data, batch_size=batch_size, num_workers=num_workers, sampler=val_sampler)
-    
-    # Remove 'shuffle=True' from DataLoader as it's handled by DistributedSampler
-    # Convert iterators to DataLoader directly
+    dataloader = DataLoader(
+        train_data, batch_size=batch_size, num_workers=num_workers, shuffle=True)
+    dataloader_val = DataLoader(
+        val_data, batch_size=batch_size, num_workers=num_workers, shuffle=True)
+    train_data = iter(dataloader)
+    val_data = iter(dataloader_val)
 elif dataset == "torch_dataset":
     from dataset import CorpusDataset
     from utils import pad_collate
     from sklearn.model_selection import train_test_split
-    # [The 'torch_dataset' section will need adjustments similar to the 'huggingface' section if applicable]
+    
+    # parameters
+    file_path = ""
+    column_text = ""
+    with tqdm.tqdm() as bar:
+        bar.set_description('Reading CSV')
+        data = pd.read_csv(file_path,
+                           skiprows=lambda x: bar.update(1) and False)
+    vocab = tokenizer.get_vocab()
+    vocab_size = len(vocab)
+    train_data, val_data = train_test_split(data, train_size=0.85)
+    train_data = train_data.reset_index(drop=True)
+    val_data = val_data.reset_index(drop=True)
+    data = {"train": train_data, "val": val_data}
+
+    datatrain = CorpusDataset(data["train"][column_text])
+    dataloader = DataLoader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        collate_fn=lambda x: pad_collate(x, tokenizer),
+    )
+    datatest = CorpusDataset(data["val"][column_text])
+    dataloader_val = DataLoader(
+        val_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        collate_fn=lambda x: pad_collate(x, tokenizer),
+    )
+    train_data = iter(dataloader)
+    val_data = iter(dataloader_val)
 else:
     print("Invalid dataset.")
-
 
 def get_batch(split):
     if dataset == "memmap":
@@ -169,105 +182,116 @@ def get_lr_cosine_warmup(config_lr, steps):
 
 
 if __name__ == '__main__':
-    # Initialize DDP environment
-    torch.cuda.set_device(args.local_rank)  # Set current device to local rank
-    dist.init_process_group(backend='nccl')  # Initialize the process group
-
     with open(config_file, 'r') as f:
         config = json.load(f)
 
     config = GPTConfig(**config)
-    if args.local_rank == 0:
-        print(f'Max length: {config.max_length} Vocab Size: {config.vocab_size}')
+    print(
+        f'Max length: {config.max_length} Vocab Size: {config.vocab_size}')
     model = GPT(config)
-    
-    # Move and wrap model for DDP
     model = model.to(device)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
-    
     step = 0
-    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    optimizer = model.configure_optimizers(
+        weight_decay, learning_rate, (beta1, beta2), device_type)
     
-    # Load checkpoint only on the master process
-    if checkpoint and args.local_rank == 0:
-        model_stat = torch.load(model_path, map_location=device)
+    if checkpoint:
+        model_stat = torch.load(model_path)
         model.load_state_dict(model_stat["model_state_dict"])
         step = model_stat['step']
         optimizer.load_state_dict(model_stat["optimizer_state_dict"])
-    
-    # Initialize AMP scaler
+
+    scaler = torch.cuda.amp.GradScaler()
+    if wandb_log:
+        wandb.init(
+            project=project,
+            resume=resume,
+            id=id,
+            name=name,
+            config={
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "lr": optimizer.param_groups[0]["lr"],
+                "loss_fn": "crossentropyloss",
+            },
+        )
+
+    print('Device: ', device)
+    print(tokenizer.decode(tokenizer.encode(
+        "---------------GPT Model----------------")))
+
+    # AMP & Gradient Accumulation to prevent CUDA Out of Memory Error
     scaler = torch.cuda.amp.GradScaler()
 
-    # Initialize wandb only on the master process
-    if wandb_log and args.local_rank == 0:
-        wandb.init(project=project, resume=resume, id=id, name=name, config={
-            "epochs": epochs,
-            "batch_size": batch_size,
-            "lr": optimizer.param_groups[0]["lr"],
-            "loss_fn": "crossentropyloss",
-        })
+    with tqdm(total=n_steps, unit="batch", position=0, leave=True) as t_steps:
+        t_steps.update(step)
+        while step < n_steps:
+            xBatch, yBatch = get_batch('train')
 
-    if args.local_rank == 0:
-        print('Device: ', device)
-        # Example tokenizer usage omitted for brevity
+            lr = get_lr_cosine_warmup(
+                config_lr, step + 1) if decay_lr else learning_rate
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
 
-        "---------------GPT Model----------------")))
-# AMP & Gradient Accumulation to prevent CUDA Out of Memory Error
-scaler = torch.cuda.amp.GradScaler()
+            with torch.autocast(device_type=device_type):
+                logits, loss = model(xBatch, target=yBatch)
 
-with tqdm(total=n_steps, unit="batch", position=0, leave=True) as t_steps:
-    t_steps.update(step)
-    while step < n_steps:
-        xBatch, yBatch = get_batch('train')
+            scaler.scale(loss / num_accumulation_steps).backward()
+            t_steps.update(1)
+            t_steps.set_postfix(step_loss=loss.item(), learning_rate=lr)
+            if ((step + 1) % num_accumulation_steps == 0):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            if (step % (checkpoint_interval) == 0):
+                torch.save(
+                    {
+                        "step": step,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                    },
+                    f"{save_directory}/microGPT-step-{step}.pth",
+                )
+            if step % (eval_interval) == 0:
+                losses = estimate_loss(
+                    model,
+                    eval_iters=eval_iters,
+                )
+                print(
+                    f"Current step {step}: train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}, lr: {lr}"
+                )
+                if wandb_log:
+                    metrics = {
+                        "train/train_loss": losses["train"],
+                        "train/steps": step,
+                        "validation/val_loss": losses["val"],
+                        "validation/steps": step,
+                        "models/lr": lr
+                    }
+                    wandb.log(metrics)
+            step += 1
 
-        lr = get_lr_cosine_warmup(config_lr, step + 1) if decay_lr else learning_rate
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-
-        with torch.cuda.amp.autocast(device_type=device_type):
-            logits, loss = model(xBatch, target=yBatch)
-
-        scaler.scale(loss / num_accumulation_steps).backward()
-        t_steps.update(1)
-        t_steps.set_postfix(step_loss=loss.item(), learning_rate=lr)
-        if ((step + 1) % num_accumulation_steps == 0):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_norm_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-
-        # Checkpoint saving only by master process
-        if args.local_rank == 0 and (step % checkpoint_interval == 0):
-            torch.save({
-                "step": step,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            }, f"{save_directory}/microGPT-step-{step}.pth")
-
-        # Evaluation and logging only by master process
-        if args.local_rank == 0 and step % eval_interval == 0:
-            losses = estimate_loss(model, eval_iters=eval_iters)
-            print(f"Current step {step}: train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}, lr: {lr}")
-            if wandb_log:
-                metrics = {
-                    "train/train_loss": losses["train"],
-                    "train/steps": step,
-                    "validation/val_loss": losses["val"],
-                    "validation/steps": step,
-                    "models/lr": lr
-                }
-                wandb.log(metrics)
-        step += 1
-
-# Final evaluation and logging only by master process
-if args.local_rank == 0:
-    losses = estimate_loss(model, eval_iters=eval_iters)
-    print(f"Final train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}")
-    # Generation example omitted for brevity
-    torch.save({
-        "step": step,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-    }, f"{save_directory}/microGPT.pth")
-
+    losses = estimate_loss(
+        model,
+        eval_iters=eval_iters,
+    )
+    print(
+        f"Final train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}")
+    context = torch.tensor(tokenizer.encode(
+        "How are you?\n"), dtype=torch.long, device=device).reshape(1, -1)
+    print(
+        tokenizer.decode(
+            model.generate(
+                context, max_tokens_generate=5000, top_k=0, top_p=0.9, temperature=0.8
+            ).tolist()
+        )
+    )
+    torch.save(
+        {
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        },
+        f"{save_directory}/microGPT.pth"
+    )
