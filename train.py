@@ -1,3 +1,5 @@
+"""---------------Imports----------------"""
+
 from gpt import GPT
 from tqdm import tqdm
 from torch.utils.data import DataLoader
@@ -11,6 +13,8 @@ import os
 import wandb
 import json
 
+"""---------------Device and Tokenizer----------------"""   
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device_type = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -23,8 +27,12 @@ tokenizer = GPT2TokenizerFast(
     model_max_length=max_length,
 )
 
+"""---------------Config----------------"""
+
 # hyperparameters
 config_file="config/config.json"
+
+"""---------------Model Configuration----------------"""
 
 # model config
 max_length = 512
@@ -38,11 +46,17 @@ eval_interval = 2000
 eval_iters = 100
 vocab_size = len(tokenizer.get_vocab())
 save_directory = "models"
+
+"""---------------Optimization----------------"""
+
 # adamw optimizer
 learning_rate = 6e-4
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
+
+"""---------------Learning Rate Schedule----------------"""
+
 # learning rate decay settings
 decay_lr = True
 config_lr = {
@@ -52,9 +66,13 @@ config_lr = {
     'lr': learning_rate
 }
 
+"""---------------Checkpointing----------------"""
+
 # checkpoints
 checkpoint=False
 model_path=""
+
+"""---------------Logging----------------"""  
 
 # wandb
 wandb_log=True
@@ -63,9 +81,13 @@ name=""
 resume=False
 id=None
 
+"""---------------Dataset----------------"""
+
 # dataset
 dataset = "memmap"
 data_dir = 'datasets'
+
+"""---------------Data Loading----------------"""
 
 if dataset == "memmap":
     train_data = np.memmap(os.path.join(
@@ -145,6 +167,7 @@ def get_batch(split):
         y = inpt[:, 1:max_length+1]
     return x, y
 
+"""---------------Loss Estimation----------------"""
 
 @torch.no_grad()
 def estimate_loss(model, eval_iters):
@@ -168,6 +191,7 @@ def estimate_loss(model, eval_iters):
     model.train()
     return out
 
+"""---------------Learning Rate Schedule----------------"""
 
 def get_lr_cosine_warmup(config_lr, steps):
     if steps < config_lr['warmup_steps']:
@@ -180,6 +204,7 @@ def get_lr_cosine_warmup(config_lr, steps):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return config_lr['min_lr'] + coeff * (config_lr['lr'] - config_lr['min_lr'])
 
+"""---------------Training----------------"""
 
 if __name__ == '__main__':
     with open(config_file, 'r') as f:
